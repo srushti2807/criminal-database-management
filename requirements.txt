@@ -1,0 +1,6 @@
+streamlit
+pyotp
+pandas
+plotly
+bcrypt
+email-validator
