@@ -1,4 +1,3 @@
-import pyotp
 import streamlit as st
 import sqlite3
 import pandas as pd
@@ -6,11 +5,7 @@ import plotly.express as px
 from datetime import datetime, timedelta
 import bcrypt
 import time
-import re
-import random
-import smtplib
-from email.message import EmailMessage
-
+import boto3
 
 # Set page configuration
 st.set_page_config(page_title="Criminal Management System", page_icon="🚔", layout="wide")
@@ -120,7 +115,8 @@ class CriminalManagementSystem:
     def __init__(self):
         self.conn = sqlite3.connect('criminal_records.db')
         self.c = self.conn.cursor()
-
+        self.create_tables()
+        self.create_triggers()
 
     def create_tables(self):
         self.c.execute('''CREATE TABLE IF NOT EXISTS criminal
@@ -158,18 +154,11 @@ class CriminalManagementSystem:
                            deletion_date TEXT)''')
 
         self.c.execute('''CREATE TABLE IF NOT EXISTS users
-                                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                   username TEXT UNIQUE,
-                                   password TEXT,
-                                   email TEXT UNIQUE,
-                                   role TEXT)''')
-        self.c.execute('''CREATE TABLE IF NOT EXISTS password_reset_tokens
-                              (email TEXT PRIMARY KEY,
-                               token TEXT,
-                               created_at DATETIME,
-                               expiry DATETIME)''')
+                          (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                           username TEXT UNIQUE,
+                           password TEXT,
+                           role TEXT)''')
         self.conn.commit()
-        
 
     def create_triggers(self):
         self.c.execute('''
@@ -263,220 +252,84 @@ class CriminalManagementSystem:
             return True
         return False
 
-   
-    def add_user(self, username, password, email, role, max_retries=5, retry_delay=1):
-     hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
-     
-     for attempt in range(max_retries):
-         try:
-             # Check if the user already exists
-             self.c.execute('SELECT username FROM users WHERE username = ?', (username,))
-             if self.c.fetchone() is not None:
-                 print(f"User '{username}' already exists. Skipping creation.")
-                 return False
-             
-             # Check if the email already exists
-             self.c.execute('SELECT email FROM users WHERE email = ?', (email,))
-             if self.c.fetchone() is not None:
-                 print(f"Email '{email}' is already registered. Skipping creation.")
-                 return False
- 
-             # Insert the new user
-             self.c.execute('INSERT INTO users (username, password, email, role) VALUES (?, ?, ?, ?)',
-                            (username, hashed_password, email, role))
-             self.conn.commit()
-             print(f"User '{username}' added successfully.")
-             return True
-         except sqlite3.IntegrityError as e:
-             print(f"IntegrityError: {e}. Skipping creation.")
-             return False
-         except sqlite3.OperationalError as e:
-             if "database is locked" in str(e) and attempt < max_retries - 1:
-                 print(f"Database is locked. Retrying in {retry_delay} seconds...")
-                 time.sleep(retry_delay)
-             else:
-                 raise
-     
-     print(f"Failed to add user '{username}' after {max_retries} attempts.")
-     return False
- 
+    def add_user(self, username, password, role):
+        try:
+            # Option 1: Using DynamoDB
+            try:
+                # Create a DynamoDB resource
+                dynamodb = boto3.resource('dynamodb')
+                users_table = dynamodb.Table('users')
+                
+                # Hash the password
+                hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+                
+                # Create the user item
+                user_item = {
+                    'username': username,
+                    'password': hashed_password.decode('utf-8'),  # Store as string
+                    'role': role,
+                    'created_at': datetime.now().isoformat()
+                }
+                
+                # Add the user to DynamoDB
+                users_table.put_item(Item=user_item)
+                print(f"User '{username}' added successfully to DynamoDB.")
+                return True
+            except Exception as e:
+                print(f"Error adding user to DynamoDB: {e}")
+                # Fall back to SQLite if DynamoDB fails
+                
+            # Option 2: Using SQLite (fallback)
+            hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+            self.c.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
+                          (username, hashed_password.decode('utf-8'), role))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            print(f"Error adding user: {e}")
+            return False
 
     def authenticate_user(self, username, password):
-            self.c.execute('SELECT password, role FROM users WHERE username = ?', (username,))
-            user = self.c.fetchone()
-            if user and bcrypt.checkpw(password.encode('utf-8'), user[0]):
-                return user[1]  # Return the role
+        try:
+            # Option 1: Try DynamoDB first
+            try:
+                # Create a DynamoDB resource
+                dynamodb = boto3.resource('dynamodb')
+                users_table = dynamodb.Table('users')
+                
+                # Query for the user
+                response = users_table.get_item(Key={'username': username})
+                
+                # Check if user exists
+                if 'Item' in response:
+                    user = response['Item']
+                    
+                    # Check password
+                    if bcrypt.checkpw(password.encode('utf-8'), user['password'].encode('utf-8')):
+                        return user['role']
+            except Exception as e:
+                print(f"DynamoDB authentication failed: {e}")
+                # Fall back to SQLite
+            
+            # Option 2: Fall back to SQLite
+            self.c.execute("SELECT password, role FROM users WHERE username=?", (username,))
+            result = self.c.fetchone()
+            
+            if result:
+                stored_password, role = result
+                if bcrypt.checkpw(password.encode('utf-8'), stored_password.encode('utf-8')):
+                    return role
+            
             return None
-    
-    def generate_otp(self, email):
-            totp = pyotp.TOTP(pyotp.random_base32())
-            otp = totp.now()
-            
-            expiry = datetime.now() + timedelta(minutes=10)
-            
-            self.c.execute('DELETE FROM password_reset_tokens WHERE email = ?', (email,))
-            
-            self.c.execute('''INSERT INTO password_reset_tokens 
-                              (email, token, created_at, expiry) 
-                              VALUES (?, ?, datetime('now'), ?)''', 
-                           (email, otp, expiry))
-            self.conn.commit()
-            
-            return otp
-    
-            
-            
-    def store_otp(self, email, otp):
-            """Store OTP for password reset"""
-            expiry = datetime.now() + timedelta(minutes=10)
-            
-            self.c.execute('DELETE FROM password_reset_tokens WHERE email = ?', (email,))
-            
-            self.c.execute('''INSERT INTO password_reset_tokens 
-                              (email, token, created_at, expiry) 
-                              VALUES (?, ?, datetime('now'), ?)''', 
-                           (email, otp, expiry))
-            self.conn.commit()
-
-    def verify_otp(self, email, user_otp):
-           """Verify the OTP for password reset"""
-           self.c.execute('''SELECT token, expiry 
-                             FROM password_reset_tokens 
-                             WHERE email = ? AND expiry > datetime('now')''', 
-                          (email,))
-           result = self.c.fetchone()
-           
-           if result:
-               stored_otp, expiry = result
-               if str(stored_otp) == str(user_otp):
-                   self.c.execute('DELETE FROM password_reset_tokens WHERE email = ?', (email,))
-                   self.conn.commit()
-                   return True
-           return False
-   
-   
-    def reset_user_password(self, email, new_password):
-         """Reset user password"""
-         hashed_password = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt())
-         
-         self.c.execute('UPDATE users SET password = ? WHERE username = ?', 
-                        (hashed_password, email))
-         self.conn.commit()
-         return True
-     
-    def email_exists(self, email):
-             """Check if email exists in users table"""
-             self.c.execute('SELECT * FROM users WHERE username = ?', (email,))
-             return self.c.fetchone() is not None
-     
-
-    
-
+        except Exception as e:
+            print(f"Authentication error: {e}")
+            return None
 
 def parse_date(date_str):
     try:
         return pd.to_datetime(date_str)
     except:
         return None
-def generate_and_send_otp(email):
-    otp = ""
-    for i in range(6):
-        otp += str(random.randint(0, 9))
-    
-    server = smtplib.SMTP('smtp.gmail.com', 587)
-    server.starttls()
-
-    from_mail = 'ishaandhuri4@gmail.com'
-    server.login(from_mail, 'heqo paom rhta vfbq')
-
-    msg = EmailMessage()
-    msg['Subject'] = "OTP VERIFICATION"
-    msg['From'] = from_mail
-    msg['To'] = email
-    msg.set_content(f"Your OTP is: {otp}")
-
-    server.send_message(msg)
-    server.quit()
-
-    return otp
-
-
-
-def validate_email(email):
-    """Simple email validation"""
-    email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    return re.match(email_regex, email) is not None
-
-def send_otp_email(email, otp):
-    # In a real application, implement email sending logic here
-    # For this example, we'll just print the OTP
-    print(f"OTP for {email}: {otp}")
-    return True
-
-def get_all_users(self):
-    self.c.execute('SELECT id, username, email, role FROM users')
-    return self.c.fetchall()
-
-def get_user_by_email(self, email):
-    self.c.execute('SELECT id, username, email, role FROM users WHERE email = ?', (email,))
-    return self.c.fetchone()
-
-
-
-def forgot_password_view(cms):
-    st.title("🔐 Forgot Password")
-    
-    if 'reset_step' not in st.session_state:
-        st.session_state.reset_step = 'email'
-
-    if st.session_state.reset_step == 'email':
-        email = st.text_input("Enter your registered email")
-        if st.button("Send OTP"):
-            if not email or not validate_email(email):
-                st.warning("Please enter a valid email address")
-            elif not cms.email_exists(email):
-                st.warning("Email not found in our system")
-            else:
-                try:
-                    otp = generate_and_send_otp(email)
-                    cms.store_otp(email, otp)
-                    st.success("OTP sent to your email. Please check your inbox.")
-                    st.session_state.reset_email = email
-                    st.session_state.reset_step = 'otp'
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to send OTP. Error: {str(e)}")
-
-    elif st.session_state.reset_step == 'otp':
-        st.subheader("Enter OTP")
-        otp_input = st.text_input("Enter the OTP sent to your email", key="otp_input")
-        if st.button("Verify OTP"):
-            if cms.verify_otp(st.session_state.reset_email, otp_input):
-                st.session_state.reset_step = 'reset_password'
-                st.rerun()
-            else:
-                st.error("Invalid OTP. Please try again.")
-
-    elif st.session_state.reset_step == 'reset_password':
-        st.subheader("Reset Password")
-        new_password = st.text_input("Enter New Password", type="password")
-        confirm_password = st.text_input("Confirm New Password", type="password")
-        if st.button("Reset Password"):
-            if new_password != confirm_password:
-                st.warning("Passwords do not match")
-            elif len(new_password) < 8:
-                st.warning("Password must be at least 8 characters long")
-            else:
-                if cms.reset_user_password(st.session_state.reset_email, new_password):
-                    st.success("Password reset successfully. Please log in with your new password.")
-                    st.session_state.reset_step = 'email'
-                    st.session_state.reset_email = None
-                    time.sleep(2)
-                    st.rerun()
-                else:
-                    st.error("Failed to reset password. Please try again.")
-
-
 
 def home_view(cms):
     st.title("🏛 Criminal Management System")
@@ -667,11 +520,11 @@ def statistics_view(cms):
         total_crimes = df_crime["Count"].sum()
         st.metric("Total Crimes Recorded", total_crimes)
         
-        most_common_crime = df_crime.loc[df_crime["Count"].idxmax(), "Crime Type"]
+        most_common_crime = df_crime.loc[df_crime["Count"].idxmax(), "Crime Type"] if not df_crime.empty else "N/A"
         st.metric("Most Common Crime", most_common_crime)
     
     with col2:
-        avg_crimes_per_type = df_crime["Count"].mean()
+        avg_crimes_per_type = df_crime["Count"].mean() if not df_crime.empty else 0
         st.metric("Average Crimes per Type", f"{avg_crimes_per_type:.2f}")
         
         crime_types_count = len(df_crime)
@@ -696,27 +549,15 @@ def deleted_records_view(cms):
         st.info("No deleted records found")
 
 def user_management_view(cms):
-    st.title("Admin Dashboard")
     st.subheader("User Management")
-    
-    with st.form("user_management_form"):
-        new_username = st.text_input("New Username")
-        new_password = st.text_input("New Password", type="password")
-        email = st.text_input("Email Address")
-        role = st.selectbox("Role", ["admin", "user"])
-        
-        submitted = st.form_submit_button("Add User")
-        
-        if submitted:
-            if not new_username or not new_password or not email:
-                st.error("All fields are required")
-            elif not validate_email(email):
-                st.error("Please enter a valid email address")
-            else:
-                if cms.add_user(new_username, new_password, email, role):
-                    st.success(f"User {new_username} added successfully")
-                else:
-                    st.error("Failed to add user. Username or email may already exist.")
+    new_username = st.text_input("New Username")
+    new_password = st.text_input("New Password", type="password")
+    new_role = st.selectbox("Role", ["admin", "user"])
+    if st.button("Add User"):
+        if cms.add_user(new_username, new_password, new_role):
+            st.success("User added successfully")
+        else:
+            st.error("Failed to add user. Username may already exist.")
 
 def admin_view(cms):
     st.title("Admin Dashboard")
@@ -754,38 +595,19 @@ def main():
         st.session_state.logged_in = False
         st.session_state.role = None
 
-    if 'view' not in st.session_state:
-        st.session_state.view = 'login'
-
     if not st.session_state.logged_in:
-        if st.session_state.view == 'login':
-            st.title("🔐 Login")
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                if st.button("Login"):
-                    role = cms.authenticate_user(username, password)
-                    if role:
-                        st.session_state.logged_in = True
-                        st.session_state.role = role
-                        st.success(f"Logged in as {role}")
-                        st.rerun()
-                    else:
-                        st.error("Invalid username or password")
-            
-            with col2:
-                if st.button("Forgot Password"):
-                    st.session_state.view = 'forgot_password'
-                    st.session_state.reset_step = 'email'
-                    st.rerun()
-        
-        elif st.session_state.view == 'forgot_password':
-            forgot_password_view(cms)
-            if st.button("Back to Login"):
-                st.session_state.view = 'login'
+        st.title("🔐 Login")
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        if st.button("Login"):
+            role = cms.authenticate_user(username, password)
+            if role:
+                st.session_state.logged_in = True
+                st.session_state.role = role
+                st.success(f"Logged in as {role}")
                 st.rerun()
+            else:
+                st.error("Invalid username or password")
     else:
         if st.session_state.role == 'admin':
             admin_view(cms)
@@ -793,15 +615,13 @@ def main():
             user_view(cms)
 
         if st.sidebar.button("Logout"):
-            st.session_state.logged_in = False
+            st.session_state.logged_in = False 
             st.session_state.role = None
-            st.session_state.view = 'login'
             st.rerun()
 
 if __name__ == "__main__":
     main()
 
-          
 # Uncomment and run once to add the first admin user
 cms = CriminalManagementSystem()
-cms.add_user("admin", "admin_password", "admin@example.com", "admin")
+cms.add_user("admin", "srush2807","admin")
