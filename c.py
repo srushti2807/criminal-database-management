@@ -624,4 +624,4 @@ if __name__ == "__main__":
 
 # Uncomment and run once to add the first admin user
 cms = CriminalManagementSystem()
-cms.add_user("admin", "srush2807","admin")
+cms.add_user("admin", "admin_password","admin")
