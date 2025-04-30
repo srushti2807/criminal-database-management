@@ -117,7 +117,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 class CriminalManagementSystem:
-    def _init_(self):
+    def __init__(self):
         self.conn = sqlite3.connect('criminal_records.db')
         self.c = self.conn.cursor()
 
@@ -798,7 +798,7 @@ def main():
             st.session_state.view = 'login'
             st.rerun()
 
-if _name_ == "_main_":
+if __name__ == "_main_":
     main()
 
           
